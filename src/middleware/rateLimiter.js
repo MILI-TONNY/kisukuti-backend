@@ -95,6 +95,13 @@ const authLimiter = createLimiter({
   keyPrefix: 'auth',
 });
 
+const adminGateLimiter = createLimiter({
+  windowMs: 30 * 60 * 1000,  // 30 min
+  max: 5,                     // Only 5 passphrase/admin-login attempts per 30 min — deliberately tight
+  message: 'Too many attempts. Try again later.',
+  keyPrefix: 'admin_gate',
+});
+
 const registerLimiter = createLimiter({
   windowMs: 60 * 60 * 1000,  // 1 hour
   max: 3,                     // Max 3 registrations per hour per IP
@@ -146,5 +153,6 @@ module.exports = {
   passwordResetLimiter,
   paymentLimiter,
   bookingLimiter,
+  adminGateLimiter,
   createLimiter,
 };
