@@ -9,7 +9,7 @@ const zlib    = require('zlib');
 const db      = require('./config/database');
 const logger  = require('./utils/logger');
 const { jwt, csrf, sanitize } = require('./utils/security');
-const { generalLimiter, authLimiter, registerLimiter, passwordResetLimiter, paymentLimiter, bookingLimiter } = require('./middleware/rateLimiter');
+const { generalLimiter, authLimiter, registerLimiter, passwordResetLimiter, paymentLimiter, bookingLimiter, adminGateLimiter } = require('./middleware/rateLimiter');
 const authCtrl    = require('./controllers/authController');
 const bookingCtrl = require('./controllers/bookingController');
 const payCtrl     = require('./controllers/paymentController');
@@ -263,6 +263,14 @@ const server = http.createServer(async (req, res) => {
     await safeRun(res, () => withMiddleware(req, res, [registerLimiter, validate('register')], () => authCtrl.register(req, res)));
   } else if (pathname === '/api/auth/login' && req.method === 'POST') {
     await safeRun(res, () => withMiddleware(req, res, [authLimiter, validate('login')], () => authCtrl.login(req, res)));
+  } else if (pathname === '/api/auth/verify-otp' && req.method === 'POST') {
+    await safeRun(res, () => withMiddleware(req, res, [authLimiter, validate('verifyOtp')], () => authCtrl.verifyLoginOtp(req, res)));
+  } else if (pathname === '/api/auth/resend-otp' && req.method === 'POST') {
+    await safeRun(res, () => withMiddleware(req, res, [passwordResetLimiter, validate('resendOtp')], () => authCtrl.resendLoginOtp(req, res)));
+  } else if (pathname === '/api/admin/gate' && req.method === 'POST') {
+    await safeRun(res, () => withMiddleware(req, res, [adminGateLimiter], () => authCtrl.adminGateCheck(req, res)));
+  } else if (pathname === '/api/admin/login' && req.method === 'POST') {
+    await safeRun(res, () => withMiddleware(req, res, [adminGateLimiter], () => authCtrl.adminLogin(req, res)));
   } else if (pathname === '/api/auth/refresh' && req.method === 'POST') {
     await safeRun(res, () => authCtrl.refreshToken(req, res));
   } else if (pathname === '/api/auth/logout' && req.method === 'POST') {
@@ -345,6 +353,53 @@ const server = http.createServer(async (req, res) => {
   } else if (pathname === '/api/users/audit-logs' && req.method === 'GET') {
     await safeRun(res, () => withMiddleware(req, res, [authenticate, authorize('admin')], () => {
       send(res, 200, { success: true, data: db.audit.recent(500) });
+    }));
+  } else if (pathname === '/api/users/login-history' && req.method === 'GET') {
+    await safeRun(res, () => withMiddleware(req, res, [authenticate, authorize('admin')], () => {
+      const logs  = db.audit.recent(2000).filter(l => l.action === 'LOGIN_SUCCESS' || l.action === 'LOGIN_FAILED' || l.action === 'LOGIN_BLOCKED_LOCKED');
+      const users = db.users.findAll();
+      const userById = Object.fromEntries(users.map(u => [u.id, u]));
+
+      const history = logs.map(l => {
+        const u = userById[l.userId];
+        let meta = {};
+        try { meta = JSON.parse(l.meta || '{}'); } catch {}
+        return {
+          event:     l.action,
+          name:      u ? u.name : '(unknown — account may be deleted)',
+          email:     u ? u.email : meta.email || '(unknown)',
+          role:      u ? u.role : undefined,
+          ip:        l.ip,
+          userAgent: l.userAgent || undefined,
+          timestamp: l.timestamp,
+        };
+      });
+
+      send(res, 200, { success: true, data: history, total: history.length });
+    }));
+  } else if (pathname === '/api/users/online-sessions' && req.method === 'GET') {
+    await safeRun(res, () => withMiddleware(req, res, [authenticate, authorize('admin')], () => {
+      const fs = require('fs');
+      const path = require('path');
+      const dbFile = path.join(__dirname, '../data/kisukuti.json');
+      const raw = fs.existsSync(dbFile) ? JSON.parse(fs.readFileSync(dbFile, 'utf8')) : { refresh_tokens: [] };
+      const users = db.users.findAll();
+      const userById = Object.fromEntries(users.map(u => [u.id, u]));
+      const now = new Date();
+
+      const sessions = raw.refresh_tokens
+        .filter(t => new Date(t.expiresAt) > now)
+        .map(t => {
+          const u = userById[t.userId];
+          return {
+            name:      u ? u.name : '(unknown)',
+            email:     u ? u.email : '(unknown)',
+            sessionStartedAt: t.createdAt,
+            expiresAt: t.expiresAt,
+          };
+        });
+
+      send(res, 200, { success: true, data: sessions, total: sessions.length });
     }));
 
   // ── 404 ──────────────────────────────────────────────────────────────────
