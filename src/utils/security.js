@@ -160,6 +160,40 @@ const csrf = {
   },
 };
 
+// ─── ADMIN GATE (passphrase wall in front of the staff login) ───────────────
+const adminGate = {
+  /**
+   * Timing-safe check of the supplied passphrase against ADMIN_GATE_PASSPHRASE.
+   * The env var is never sent to the client and never logged.
+   */
+  verifyPassphrase(provided) {
+    const expected = process.env.ADMIN_GATE_PASSPHRASE;
+    if (!expected) return false; // Misconfigured server — fail closed, not open
+    if (!provided || typeof provided !== 'string') return false;
+    const a = Buffer.from(provided.padEnd(128, '\0'));
+    const b = Buffer.from(expected.padEnd(128, '\0'));
+    try {
+      return a.length === b.length && crypto.timingSafeEqual(a, b) && provided === expected;
+    } catch {
+      return false;
+    }
+  },
+
+  /** Short-lived (10 min) signed token proving the passphrase was correct. */
+  issueGateToken() {
+    return jwt.sign({ type: 'admin_gate' }, process.env.ADMIN_GATE_SECRET || process.env.JWT_ACCESS_SECRET, 600);
+  },
+
+  verifyGateToken(token) {
+    try {
+      const payload = jwt.verify(token, process.env.ADMIN_GATE_SECRET || process.env.JWT_ACCESS_SECRET);
+      return payload.type === 'admin_gate';
+    } catch {
+      return false;
+    }
+  },
+};
+
 // ─── INPUT SANITIZATION ─────────────────────────────────────────────────────
 const sanitize = {
   /** Strip HTML tags and dangerous characters */
@@ -197,13 +231,16 @@ const sanitize = {
     return clean;
   },
 
-  /** Validate and normalize Kenyan phone number → 2547XXXXXXXX */
+  /** Validate and normalize Kenyan phone number → 2547XXXXXXXX or 2541XXXXXXXX */
   phone(phone) {
     const cleaned = phone.replace(/\D/g, '');
-    if (/^07\d{8}$/.test(cleaned))   return '254' + cleaned.slice(1);
-    if (/^254\d{9}$/.test(cleaned))  return cleaned;
-    if (/^7\d{8}$/.test(cleaned))    return '254' + cleaned;
-    throw Object.assign(new Error('Invalid Kenyan phone number format'), { statusCode: 422 });
+    // 07XXXXXXXX or 01XXXXXXXX (10 digits, starting 07 or 01)
+    if (/^0[17]\d{8}$/.test(cleaned))  return '254' + cleaned.slice(1);
+    // Already in 2547XXXXXXXX or 2541XXXXXXXX format (12 digits)
+    if (/^254[17]\d{8}$/.test(cleaned)) return cleaned;
+    // Bare 7XXXXXXXX or 1XXXXXXXX (9 digits, no leading 0)
+    if (/^[17]\d{8}$/.test(cleaned))    return '254' + cleaned;
+    throw Object.assign(new Error('Invalid Kenyan phone number. Use format 07XXXXXXXX or 01XXXXXXXX'), { statusCode: 422 });
   },
 
   /** Validate email format */
@@ -215,6 +252,29 @@ const sanitize = {
 };
 
 // ─── RANDOM TOKEN GENERATION ────────────────────────────────────────────────
+// ─── ONE-TIME PASSCODE (OTP) FOR LOGIN ──────────────────────────────────────
+const otp = {
+  /** Generate a 6-digit numeric OTP using a cryptographically secure RNG */
+  generate() {
+    // crypto.randomInt is rejection-sampled, so this is uniformly distributed
+    return crypto.randomInt(100000, 999999).toString();
+  },
+  /** Hash an OTP for storage (never store the raw code) */
+  hash(code) {
+    return crypto.createHash('sha256').update(code).digest('hex');
+  },
+  /** Timing-safe OTP comparison */
+  verify(provided, storedHash) {
+    if (!provided || !storedHash) return false;
+    const providedHash = otp.hash(provided);
+    try {
+      return crypto.timingSafeEqual(Buffer.from(providedHash, 'hex'), Buffer.from(storedHash, 'hex'));
+    } catch {
+      return false;
+    }
+  },
+};
+
 const tokens = {
   /** Generate a cryptographically random reset/verify token */
   generate(bytes = 32) {
@@ -254,4 +314,4 @@ const mpesa = {
   },
 };
 
-module.exports = { password, jwt, csrf, sanitize, tokens, mpesa, validatePasswordStrength };
+module.exports = { password, jwt, csrf, sanitize, tokens, mpesa, otp, adminGate, validatePasswordStrength };
