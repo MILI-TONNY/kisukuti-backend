@@ -29,6 +29,16 @@ async function sendEmail({ to, subject, html, text }) {
 /**
  * Minimal SMTP client using Node's built-in net/tls modules.
  * Supports STARTTLS (port 587) and implicit TLS (port 465) with AUTH LOGIN.
+ *
+ * This is a proper line-buffered state machine: SMTP responses can span
+ * multiple lines (e.g. Gmail's EHLO reply lists ~8 capabilities as
+ * "250-STARTTLS\r\n250-AUTH LOGIN PLAIN\r\n...250 SMTPUTF8\r\n"), and only
+ * the FINAL line of a multi-line reply has a space after the 3-digit code
+ * (250 vs 250-). We must wait for that final line before sending the next
+ * command, and we advance through named states rather than inferring
+ * position from a command index, since a single state can correspond to
+ * several mail commands.
+ *
  * For high-volume production use, consider nodemailer or a transactional
  * email API (SES/SendGrid/Postmark) instead — this is intentionally minimal.
  */
@@ -44,6 +54,10 @@ function sendViaSMTP({ to, subject, html, text }) {
     const pass   = process.env.SMTP_PASS;
     const from   = process.env.EMAIL_FROM || `"Kisukuti Tents" <${user}>`;
 
+    if (!host || !user || !pass) {
+      return reject(new Error('SMTP not configured (missing SMTP_HOST/SMTP_USER/SMTP_PASS)'));
+    }
+
     const messageId = `<${Date.now()}.${Math.random().toString(36).slice(2)}@kisukutitents.co.ke>`;
     const body = [
       `From: ${from}`,
@@ -53,89 +67,154 @@ function sendViaSMTP({ to, subject, html, text }) {
       'MIME-Version: 1.0',
       'Content-Type: text/html; charset=UTF-8',
       '',
-      html || text || '',
+      (html || text || '').replace(/^\.\s*$/gm, '..'), // escape lone "." lines per SMTP DATA rules
+      '',
     ].join('\r\n');
 
-    const commands = [];
-    let cmdIndex = 0;
+    // ── Named states, advanced explicitly — not inferred from a counter ──
+    const STATES = ['CONNECT', 'EHLO', 'STARTTLS', 'EHLO2', 'AUTH_LOGIN', 'AUTH_USER', 'AUTH_PASS', 'MAIL_FROM', 'RCPT_TO', 'DATA', 'BODY', 'QUIT', 'DONE'];
+    let state = secure ? 'EHLO' : 'CONNECT';
+
     let socket;
+    let buffer = '';
+    let settled = false;
 
-    function nextCommand(line) {
-      const code = parseInt(line.slice(0, 3));
-      if (code >= 400) return reject(new Error(`SMTP error: ${line}`));
-      if (cmdIndex < commands.length) {
-        const cmd = commands[cmdIndex++];
-        socket.write(cmd + '\r\n');
-      }
-    }
-
-    function buildCommands() {
-      commands.push(`EHLO kisukutitents.co.ke`);
-      if (!secure) commands.push('STARTTLS');
-      commands.push(`AUTH LOGIN`);
-      commands.push(Buffer.from(user).toString('base64'));
-      commands.push(Buffer.from(pass).toString('base64'));
-      commands.push(`MAIL FROM:<${user}>`);
-      commands.push(`RCPT TO:<${to}>`);
-      commands.push('DATA');
-      commands.push(body + '\r\n.');
-      commands.push('QUIT');
-    }
-    buildCommands();
-
-    const onConnect = (sock) => {
-      socket = sock;
-      socket.setTimeout(15000);
-      socket.on('timeout', () => { socket.destroy(); reject(new Error('SMTP connection timed out')); });
-      socket.on('error', reject);
-
-      let buffer = '';
-      socket.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\r\n').filter(Boolean);
-        const last  = lines[lines.length - 1];
-        if (!last) return;
-
-        // Handle STARTTLS upgrade
-        if (last.startsWith('220') && cmdIndex === 1 && !secure) {
-          buffer = '';
-          socket.write('STARTTLS\r\n');
-          cmdIndex++;
-          return;
-        }
-        if (last.startsWith('220') && commands[cmdIndex - 1] === 'STARTTLS') {
-          buffer = '';
-          const tlsSocket = tls.connect({ socket, servername: host, rejectUnauthorized: true }, () => {
-            socket = tlsSocket;
-            tlsSocket.write(`EHLO kisukutitents.co.ke\r\n`);
-            tlsSocket.on('data', handleTLSData);
-          });
-          return;
-        }
-        buffer = '';
-        nextCommand(last);
-        if (last.startsWith('250') && commands[cmdIndex - 1]?.startsWith('.')) {
-          resolve({ messageId });
-        }
-      });
-
-      function handleTLSData(chunk) {
-        const line = chunk.toString().split('\r\n').filter(Boolean).pop();
-        if (!line) return;
-        const code = parseInt(line.slice(0, 3));
-        if (code >= 400) return reject(new Error(`SMTP error: ${line}`));
-        nextCommand(line);
-        if (line.startsWith('250') && cmdIndex >= commands.length) {
-          resolve({ messageId });
-        }
-      }
+    const finish = (err, result) => {
+      if (settled) return;
+      settled = true;
+      try { socket?.end(); } catch {}
+      if (err) reject(err); else resolve(result);
     };
 
-    if (secure) {
-      onConnect(tls.connect({ host, port, rejectUnauthorized: true }));
-    } else {
-      onConnect(net.connect({ host, port }));
+    const timeoutHandle = setTimeout(() => finish(new Error('SMTP connection timed out')), 20000);
+    const clearAndFinish = (err, result) => { clearTimeout(timeoutHandle); finish(err, result); };
+
+    function send(line) {
+      socket.write(line + '\r\n');
     }
+
+    /** Called once we have one or more complete, COMPLETE (final-line) SMTP replies in `buffer`. */
+    function handleReply(replyLines) {
+      const last = replyLines[replyLines.length - 1];
+      const code = parseInt(last.slice(0, 3), 10);
+
+      if (code >= 400) {
+        return clearAndFinish(new Error(`SMTP error in state ${state}: ${last}`));
+      }
+
+      switch (state) {
+        case 'CONNECT': // initial 220 banner
+          state = 'EHLO';
+          send(`EHLO kisukutitents.co.ke`);
+          break;
+
+        case 'EHLO': // reply to EHLO (plaintext, pre-STARTTLS) or EHLO over implicit TLS
+          if (secure) {
+            state = 'AUTH_LOGIN';
+            send('AUTH LOGIN');
+          } else {
+            state = 'STARTTLS';
+            send('STARTTLS');
+          }
+          break;
+
+        case 'STARTTLS': // reply to STARTTLS command — now upgrade the socket
+          upgradeToTLS();
+          break;
+
+        case 'EHLO2': // reply to the EHLO sent again after the TLS upgrade
+          state = 'AUTH_LOGIN';
+          send('AUTH LOGIN');
+          break;
+
+        case 'AUTH_LOGIN': // server asks for username (base64)
+          state = 'AUTH_USER';
+          send(Buffer.from(user).toString('base64'));
+          break;
+
+        case 'AUTH_USER': // server asks for password (base64)
+          state = 'AUTH_PASS';
+          send(Buffer.from(pass).toString('base64'));
+          break;
+
+        case 'AUTH_PASS': // authenticated
+          state = 'MAIL_FROM';
+          send(`MAIL FROM:<${user}>`);
+          break;
+
+        case 'MAIL_FROM':
+          state = 'RCPT_TO';
+          send(`RCPT TO:<${to}>`);
+          break;
+
+        case 'RCPT_TO':
+          state = 'DATA';
+          send('DATA');
+          break;
+
+        case 'DATA': // 354 "start mail input" — send headers+body, end with bare "."
+          state = 'BODY';
+          send(body + '\r\n.');
+          break;
+
+        case 'BODY': // message accepted
+          state = 'QUIT';
+          send('QUIT');
+          break;
+
+        case 'QUIT':
+          state = 'DONE';
+          clearAndFinish(null, { messageId });
+          break;
+
+        default:
+          clearAndFinish(new Error(`Unexpected SMTP state: ${state}`));
+      }
+    }
+
+    function upgradeToTLS() {
+      const plainSocket = socket;
+      plainSocket.removeAllListeners('data');
+      const tlsSocket = tls.connect({ socket: plainSocket, servername: host, rejectUnauthorized: true }, () => {
+        socket = tlsSocket;
+        buffer = '';
+        state = 'EHLO2';
+        attachDataHandler(tlsSocket);
+        send(`EHLO kisukutitents.co.ke`);
+      });
+      tlsSocket.on('error', (e) => clearAndFinish(new Error(`TLS upgrade failed: ${e.message}`)));
+    }
+
+    function attachDataHandler(sock) {
+      sock.on('data', (chunk) => {
+        buffer += chunk.toString('utf8');
+
+        // SMTP multi-line replies: lines look like "250-foo\r\n...\r\n250 bar\r\n".
+        // Only the LAST line of a complete reply has a space (not '-') after the code.
+        // Wait until we have at least one fully-terminated line set ending in "code SPACE".
+        if (!buffer.includes('\r\n')) return; // wait for more data
+
+        const lines = buffer.split('\r\n').filter(Boolean);
+        const last  = lines[lines.length - 1];
+        // If the last line is "250-..." (continuation), the reply isn't finished yet — keep buffering.
+        if (/^\d{3}-/.test(last)) return;
+        // Must look like a real status line "NNN ..." to proceed.
+        if (!/^\d{3}([ ].*)?$/.test(last)) return;
+
+        buffer = '';
+        handleReply(lines);
+      });
+    }
+
+    // ── Kick off the connection ──────────────────────────────────────────
+    if (secure) {
+      socket = tls.connect({ host, port, rejectUnauthorized: true });
+      socket.on('secureConnect', () => attachDataHandler(socket));
+    } else {
+      socket = net.connect({ host, port });
+      attachDataHandler(socket);
+    }
+    socket.on('error', (e) => clearAndFinish(new Error(`SMTP connection error: ${e.message}`)));
   });
 }
 
