@@ -15,7 +15,7 @@
  */
 
 const db                   = require('../config/database');
-const { password, jwt, tokens, sanitize } = require('../utils/security');
+const { password, jwt, tokens, sanitize, otp, adminGate } = require('../utils/security');
 const logger               = require('../utils/logger');
 const { sendEmail }        = require('../utils/mailer');
 const crypto               = require('crypto');
@@ -23,6 +23,8 @@ const crypto               = require('crypto');
 const MAX_FAILED_LOGINS = 5;
 const LOCKOUT_MINUTES   = 15;
 const RESET_TTL_MINUTES = 15;
+const OTP_TTL_MINUTES   = 5;
+const MAX_OTP_ATTEMPTS  = 5;
 
 // ─── REGISTER ───────────────────────────────────────────────────────────────
 async function register(req, res) {
@@ -40,8 +42,12 @@ async function register(req, res) {
     });
   }
 
-  // Create user
-  const user = db.users.create({ name, email, passwordHash: hashed, phone });
+  // Create user — emails listed in ADMIN_EMAILS env var are granted the
+  // admin role automatically on signup (comma-separated, set by the company
+  // owner only; never settable by the client). Everyone else is a 'client'.
+  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+  const role = adminEmails.includes(email.toLowerCase()) ? 'admin' : 'client';
+  const user = db.users.create({ name, email, passwordHash: hashed, phone, role });
 
   // Generate email verification token
   const verifyToken     = tokens.generate(32);
@@ -120,24 +126,78 @@ async function login(req, res) {
     return res.status(401).json({ success: false, error: 'Your account has been suspended. Contact support.', code: 'ACCOUNT_SUSPENDED' });
   }
 
-  // ── Success: reset failed attempts ────────────────────────────────────
-  db.users.update(user.id, {
-    loginAttempts: 0,
-    lockedUntil:   null,
-    lastLoginAt:   new Date().toISOString(),
-    lastLoginIP:   ip,
-  });
+  // ── Password correct: reset failed attempts, but DO NOT issue tokens yet ─
+  // Tokens are only issued after the OTP step completes (see verifyLoginOtp).
+  db.users.update(user.id, { loginAttempts: 0, lockedUntil: null });
 
-  // ── Issue tokens ──────────────────────────────────────────────────────
+  // ── Generate and send a one-time passcode to the user's email ──────────
+  const code     = otp.generate();
+  const codeHash = otp.hash(code);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000).toISOString();
+  db.otpCodes.create(user.id, codeHash, expiresAt);
+
+  sendEmail({
+    to:      user.email,
+    subject: 'Your Kisukuti Tents login code',
+    html:    otpEmailTemplate(user.name, code),
+  }).catch(err => logger.error('OTP email failed:', err));
+
+  db.audit.log('LOGIN_PASSWORD_VERIFIED_OTP_SENT', user.id, { ip, email });
+  logger.info(`OTP sent for login: ${email} from ${ip}`);
+
+  res.json({
+    success: true,
+    message: `A 6-digit verification code has been sent to ${maskEmail(user.email)}. Enter it to complete login.`,
+    data: {
+      otpRequired: true,
+      userId: user.id, // needed by the client to submit the OTP verification call
+      expiresInSeconds: OTP_TTL_MINUTES * 60,
+    },
+  });
+}
+
+// ─── VERIFY LOGIN OTP (step 2 of 2) ──────────────────────────────────────────
+async function verifyLoginOtp(req, res) {
+  const { userId, code } = req.body;
+  const ip = getIP(req);
+
+  const user = db.users.findById(userId);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Invalid request. Please log in again.' });
+  }
+
+  const record = db.otpCodes.findActiveForUser(userId);
+  if (!record) {
+    return res.status(401).json({ success: false, error: 'No active code found. Please request a new one.', code: 'OTP_NOT_FOUND' });
+  }
+
+  if (new Date(record.expiresAt) < new Date()) {
+    return res.status(401).json({ success: false, error: 'This code has expired. Please log in again to get a new one.', code: 'OTP_EXPIRED' });
+  }
+
+  if ((record.attempts || 0) >= MAX_OTP_ATTEMPTS) {
+    db.audit.log('OTP_TOO_MANY_ATTEMPTS', userId, { ip });
+    return res.status(401).json({ success: false, error: 'Too many incorrect attempts. Please log in again to get a new code.', code: 'OTP_LOCKED' });
+  }
+
+  const isValid = otp.verify(code, record.codeHash);
+  if (!isValid) {
+    db.otpCodes.incrementAttempts(record.id);
+    db.audit.log('OTP_VERIFY_FAILED', userId, { ip, attempts: (record.attempts || 0) + 1 });
+    return res.status(401).json({ success: false, error: 'Incorrect code. Please try again.', code: 'OTP_INVALID' });
+  }
+
+  // ── OTP correct: consume it, issue real session tokens ─────────────────
+  db.otpCodes.markUsed(record.id);
+  db.users.update(user.id, { lastLoginAt: new Date().toISOString(), lastLoginIP: ip });
+
   const { access, refresh, expiresIn } = jwt.generatePair(user.id, user.role, user.email);
   const refreshHash = jwt.hashRefreshToken(refresh);
   db.refreshTokens.save(user.id, refreshHash, new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString());
-
-  // Store refresh token in HttpOnly cookie
   setRefreshCookie(res, refresh);
 
-  db.audit.log('LOGIN_SUCCESS', user.id, { ip, email });
-  logger.info(`User logged in: ${email} from ${ip}`);
+  db.audit.log('LOGIN_SUCCESS', user.id, { ip, email: user.email });
+  logger.info(`User logged in (OTP verified): ${user.email} from ${ip}`);
 
   res.json({
     success: true,
@@ -351,6 +411,37 @@ function safeUser(user) {
   return safe;
 }
 
+// ─── RESEND LOGIN OTP ─────────────────────────────────────────────────────────
+async function resendLoginOtp(req, res) {
+  const { userId } = req.body;
+  const ip = getIP(req);
+
+  const user = db.users.findById(userId);
+  if (!user || !user.isActive) {
+    return res.status(401).json({ success: false, error: 'Invalid request. Please log in again.' });
+  }
+
+  // Rate-limited separately via route middleware; here we just regenerate
+  const code     = otp.generate();
+  const codeHash = otp.hash(code);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000).toISOString();
+  db.otpCodes.create(user.id, codeHash, expiresAt);
+
+  sendEmail({
+    to:      user.email,
+    subject: 'Your new Kisukuti Tents login code',
+    html:    otpEmailTemplate(user.name, code),
+  }).catch(err => logger.error('OTP resend email failed:', err));
+
+  db.audit.log('OTP_RESENT', user.id, { ip });
+
+  res.json({
+    success: true,
+    message: `A new verification code has been sent to ${maskEmail(user.email)}.`,
+    data: { expiresInSeconds: OTP_TTL_MINUTES * 60 },
+  });
+}
+
 function getIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
 }
@@ -370,6 +461,24 @@ function clearRefreshCookie(res) {
 }
 
 // Email templates (plain HTML, no template engine needed)
+/** Masks an email for display, e.g. agostinah@example.com → ag*****h@example.com */
+function maskEmail(email) {
+  const [local, domain] = email.split('@');
+  if (local.length <= 2) return `${local[0]}***@${domain}`;
+  return `${local.slice(0, 2)}${'*'.repeat(Math.max(local.length - 3, 3))}${local.slice(-1)}@${domain}`;
+}
+
+function otpEmailTemplate(name, code) {
+  return `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+    <h2 style="color:#1B3A2D">Kisukuti Tents — Login Verification</h2>
+    <p>Hi ${name}, use the code below to complete your login. It expires in ${OTP_TTL_MINUTES} minutes.</p>
+    <div style="background:#F5E6B8;border-radius:12px;padding:24px;text-align:center;margin:20px 0">
+      <span style="font-size:2rem;font-weight:800;letter-spacing:8px;color:#1B3A2D">${code}</span>
+    </div>
+    <p style="color:#999;font-size:12px">If you didn't try to log in, you can safely ignore this email — your account is still secure since this code alone cannot be used without your password.</p>
+  </div>`;
+}
+
 function verifyEmailTemplate(name, token, userId) {
   const url = `${process.env.FRONTEND_URL}/verify-email/${userId}/${token}`;
   return `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto">
@@ -392,4 +501,95 @@ function resetPasswordTemplate(name, token, userId) {
   </div>`;
 }
 
-module.exports = { register, login, refreshToken, logout, logoutAll, forgotPassword, resetPassword, changePassword, verifyEmail, me };
+// ─── ADMIN GATE (passphrase wall in front of the staff login) ───────────────
+/**
+ * This endpoint deliberately reveals nothing about whether the server even
+ * has an admin area. Wrong passphrase and missing-config both return the
+ * exact same generic 403 — no distinguishing information leaks either way.
+ */
+async function adminGateCheck(req, res) {
+  const { passphrase } = req.body;
+  const ip = getIP(req);
+
+  if (!adminGate.verifyPassphrase(passphrase)) {
+    db.audit.log('ADMIN_GATE_DENIED', 'anonymous', { ip });
+    logger.warn(`Admin gate denied from ${ip}`);
+    // Generic 403, deliberately slow down responses slightly to blunt automated guessing
+    await new Promise(r => setTimeout(r, 400 + Math.random() * 400));
+    return res.status(403).json({ success: false, error: 'Access denied.' });
+  }
+
+  const gateToken = adminGate.issueGateToken();
+  db.audit.log('ADMIN_GATE_PASSED', 'anonymous', { ip });
+  res.json({ success: true, data: { gateToken } });
+}
+
+// ─── ADMIN LOGIN (step 1 of 2 — requires a valid gate token, then behaves like login) ─
+async function adminLogin(req, res) {
+  const { email, password: rawPassword, gateToken } = req.body;
+  const ip = getIP(req);
+
+  if (!adminGate.verifyGateToken(gateToken)) {
+    db.audit.log('ADMIN_LOGIN_NO_GATE_TOKEN', 'anonymous', { ip, email });
+    return res.status(403).json({ success: false, error: 'Access denied.' });
+  }
+
+  // Re-use the exact same password+lockout+OTP logic as the public login,
+  // but additionally require the account to actually have the admin role
+  // BEFORE sending any OTP — non-admins never receive a code from this path.
+  const user = db.users.findByEmail(email);
+  const DUMMY_HASH = crypto.randomBytes(32).toString('hex') + ':' + crypto.randomBytes(64).toString('hex');
+
+  const isMatch = user
+    ? await password.verify(rawPassword, user.passwordHash)
+    : await password.verify(rawPassword, DUMMY_HASH).then(() => false).catch(() => false);
+
+  if (!user || !isMatch || user.role !== 'admin') {
+    if (user && user.role === 'admin') {
+      const attempts = (user.loginAttempts || 0) + 1;
+      const updates  = { loginAttempts: attempts };
+      if (attempts >= MAX_FAILED_LOGINS) {
+        updates.lockedUntil = new Date(Date.now() + LOCKOUT_MINUTES * 60000).toISOString();
+        updates.loginAttempts = 0;
+      }
+      db.users.update(user.id, updates);
+      db.audit.log('ADMIN_LOGIN_FAILED', user.id, { ip, attempts });
+    } else {
+      db.audit.log('ADMIN_LOGIN_FAILED', 'unknown', { ip, email });
+    }
+    return res.status(401).json({ success: false, error: 'Invalid email or password.', code: 'INVALID_CREDENTIALS' });
+  }
+
+  if (user.lockedUntil && new Date(user.lockedUntil) > new Date()) {
+    const mins = Math.ceil((new Date(user.lockedUntil) - new Date()) / 60000);
+    return res.status(401).json({ success: false, error: `Account locked. Try again in ${mins} minute${mins > 1 ? 's' : ''}.`, code: 'ACCOUNT_LOCKED' });
+  }
+
+  if (!user.isActive) {
+    return res.status(401).json({ success: false, error: 'Your account has been suspended.', code: 'ACCOUNT_SUSPENDED' });
+  }
+
+  db.users.update(user.id, { loginAttempts: 0, lockedUntil: null });
+
+  const code      = otp.generate();
+  const codeHash  = otp.hash(code);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000).toISOString();
+  db.otpCodes.create(user.id, codeHash, expiresAt);
+
+  sendEmail({
+    to:      user.email,
+    subject: 'Your Kisukuti Tents admin login code',
+    html:    otpEmailTemplate(user.name, code),
+  }).catch(err => logger.error('Admin OTP email failed:', err));
+
+  db.audit.log('ADMIN_LOGIN_PASSWORD_VERIFIED_OTP_SENT', user.id, { ip, email });
+  logger.info(`Admin OTP sent: ${email} from ${ip}`);
+
+  res.json({
+    success: true,
+    message: `A 6-digit verification code has been sent to ${maskEmail(user.email)}.`,
+    data: { otpRequired: true, userId: user.id, expiresInSeconds: OTP_TTL_MINUTES * 60 },
+  });
+}
+
+module.exports = { register, login, verifyLoginOtp, resendLoginOtp, refreshToken, logout, logoutAll, forgotPassword, resetPassword, changePassword, verifyEmail, me, adminGateCheck, adminLogin };
